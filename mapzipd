@@ -1,0 +1,181 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+from __future__ import with_statement
+
+import argparse
+import bz2
+import ConfigParser
+import logging
+import os
+import re
+import signal
+import sys
+
+__version__ = '0.4.0'
+__author__ = 'Alex Kuhrt'
+__metaclass__ = type
+
+# Check Python version
+if sys.version_info < (2, 5):
+    raise RuntimeError('Error: Python version not supported. Python 2.5+ required.')
+
+# Check pyinotify
+try:
+    import pyinotify
+except ImportError:
+    sys.exit('Error: pynotify module not installed.')
+
+config = ConfigParser.ConfigParser(allow_no_value=True)
+
+
+class BSPFile():
+    def __init__(self, name, path):
+        self.name = name
+        self.path = path
+        self.full_path = os.path.join(self.path, self.name)
+        self.data = None
+
+    def __str__(self):
+        return self.name
+
+    def __repr__(self):
+        return '<BSPFile> {full_path}'.format(full_path=self.full_path)
+
+    def _is_valid_name(self):
+        return re.match(r'[\w\d\-_]+\.bsp$', self.name)
+
+    def _is_valid_header(self):
+        self.get_data()
+        return self.data[:4] == 'VBSP'
+
+    def is_valid(self):
+        return self._is_valid_name() and self._is_valid_header()
+
+    def get_data(self):
+        if self.data is not None:
+            return self.data
+        
+        with open(self.full_path, 'rb') as map:
+            self.data = map.read()
+
+        return self.data
+
+
+class MapManager(pyinotify.ProcessEvent):
+    def my_init(self, webdir):
+        self.webdir =  os.path.join(webdir, 'maps')
+
+        if not os.path.isdir(self.webdir):
+            raise IOError('Error: public web directory "{webdir}" does not exist.'.format(webdir=webdir))
+
+        if not os.access(self.webdir, os.W_OK):
+            raise IOError('Error: public web directory "{webdir}" is not writeable.'.format(webdir=webdir))
+
+    def process_IN_MOVED_TO(self, event):
+        self._create_zip(event)
+
+    def process_IN_CLOSE_WRITE(self, event):
+        self._create_zip(event)
+
+    def _create_zip(self, event):
+        bsp = BSPFile(event.name, event.path)
+        if bsp.is_valid():
+            output_file = os.path.join(self.webdir, '{map_name}.bz2'.format(map_name=bsp))
+            bz2_file = bz2.BZ2File(output_file, 'wb', compresslevel=9)
+
+            try:
+                bz2_file.write(bsp.get_data())
+            except:
+                logging.error('Could not create bz2 file.')
+            else:
+                logging.info('Successfully compressed "{map}" to "{output}"'.format(map=bsp.full_path, output=output_file))
+            finally:
+                bz2_file.close()
+
+            webdir_owner = os.stat(self.webdir).st_uid
+            webdir_group = os.stat(self.webdir).st_gid
+            webdir_info = os.stat(self.webdir)
+            os.chown(output_file, webdir_info.st_uid, webdir_info.st_gid)
+
+def watch():
+    mask = pyinotify.IN_CLOSE_WRITE | pyinotify.IN_MOVED_TO
+    handler = MapManager(webdir=config.get('general','webdir'))
+    wm = pyinotify.WatchManager()
+
+    for input_dir in config.options('gameserver'):
+        input_dir = os.path.join(input_dir, 'maps')
+        if os.path.isdir(input_dir):
+            wm.add_watch(input_dir, mask)
+        else:
+            logging.warn('Could not find "{input}"!'.format(input=input_dir))
+
+    notifier = pyinotify.Notifier(wm, handler)
+
+    try:
+        notifier.loop(daemonize=True, pid_file=config.get('general', 'pidfile'))
+    except pyinotify.NotifierError, err:
+        sys.exit(err)
+
+def setup(config_file):
+    try:
+        config_file = open(config_file, 'r')
+    except IOError:
+        sys.exit('Error: {config_file} missing.'.format(config_file=config_file))
+
+    config.readfp(config_file)
+    logging.basicConfig(filename=config.get('general', 'logfile'),
+                                 filemode='w',
+                                 level=logging.INFO,
+                                 format='%(asctime)s [%(levelname)s]: %(message)s')
+    logging.info('Starting mapzipd')
+
+def start():
+    print 'Starting mapzipd'
+    pid_file = config.get('general', 'pidfile')
+
+    if os.path.exists(pid_file):
+        print 'mapzipd already running'
+        return
+
+    watch()
+
+def stop():
+    pid_file = config.get('general', 'pidfile')
+    
+    if os.path.exists(pid_file):
+        with open(pid_file) as content:
+            pid = int(content.readline())
+
+        try:
+            os.remove(pid_file)
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        
+        print 'mapzipd stopped'
+    else:
+        print 'mapzipd not running'
+
+def restart():
+    stop()
+    print 'Restarting mapzipd'
+    start()
+
+def parse():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', default='/etc/mapzipd.conf', help='Use custom config file')
+    parser.add_argument('mapzipd', choices=['start', 'stop', 'restart'])
+    args = parser.parse_args()
+
+    setup(args.config)
+
+    if args.mapzipd == 'start':
+        start()
+    elif args.mapzipd == 'stop':
+        stop()
+    elif args.mapzipd == 'restart':
+        restart()
+
+if __name__ == '__main__':
+    parse()

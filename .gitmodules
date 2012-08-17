@@ -1,0 +1,3 @@
+[submodule "pyinotify"]
+	path = pyinotify
+	url = https://github.com/seb-m/pyinotify.git
